@@ -1,0 +1,2 @@
+# EasyOCR-carton-scanning
+test
