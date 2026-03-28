@@ -7,7 +7,7 @@ from picamera2 import Picamera2
 from libcamera import controls
 
 # ── Config ────────────────────────────────────────────────────
-LAPTOP_IP  = "192.168.137.134"
+LAPTOP_IP  = "YOUR IP"
 UPLOAD_URL = f"http://{LAPTOP_IP}:5000/upload"
 BROKER     = LAPTOP_IP
 TOPIC      = "camera/capture"
