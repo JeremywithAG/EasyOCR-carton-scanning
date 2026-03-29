@@ -21,6 +21,7 @@ client.loop_start()
 state = {
     "trigger_time":     None,
     "received_devices": set(),
+    "arrival_times":    {},
 }
 timing_lock = threading.Lock()
 # ─────────────────────────────────────────────────────────────
@@ -68,13 +69,16 @@ def upload():
             print(f"[Flask] image_{device_id} received  |  "
                   f"+{elapsed:.3f}s since trigger  |  "
                   f"{count}/{len(EXPECTED_DEVICES)} images received", flush=True)
-            client.publish("scan/start", "1,2,3,4,5", qos=1) #if only using one pi
+            #client.publish("scan/start", "1,2,3,4,5", qos=1) #if only using one pi
+            state["arrival_times"][device_id] = elapsed
             if not remaining:
+                slowest_device = max(state["arrival_times"], key=state["arrival_times"].get)
+                slowest_time   = state["arrival_times"][slowest_device]
                 print("-" * 55, flush=True)
                 print(f"[Timing] All {len(EXPECTED_DEVICES)} images received in "
-                      f"{elapsed:.3f}s", flush=True)
+                      f"{slowest_time:.3f}s", flush=True)
                 print("-" * 55, flush=True)
-                #client.publish("scan/start", "1,2,3,4,5", qos=1) uncomment to only send when all 5 images are received
+                client.publish("scan/start", "1,2,3,4,5", qos=1) #uncomment to only send when all 5 images are received
                 print("[MQTT] Notified scan_node to start processing.", flush=True)
         else:
             print(f"[Flask] Saved {filename} (no active timing session)", flush=True)
