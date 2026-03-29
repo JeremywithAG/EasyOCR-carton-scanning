@@ -7,7 +7,15 @@ from pyzbar.pyzbar import decode
 from collections import Counter
 import paho.mqtt.client as mqtt
 import json
+# ── Fuzz integration ────────────────────────────────────────
+from rapidfuzz import process, fuzz
 
+def correct_with_rapidfuzz(text, wordlist, threshold=70):
+    result = process.extractOne(text, wordlist, scorer=fuzz.WRatio)
+    if result and result[1] >= threshold:
+        print(f"  Corrected '{text}' → '{result[0]}' (score: {result[1]})")
+        return result[0]
+    return text
 # ── DB CONFIG ────────────────────────────────────────
 DB_CONFIG = {
     "host": "127.0.0.1",
@@ -56,8 +64,49 @@ def lookup_by_EAN(EAN_num: str):
 def is_number(text: str):
     return text.strip().replace(" ", "").isdigit()
 
+def avg_confidence(results):
+    if not results:
+        return 0.0
+    return np.mean([conf for _, _, conf in results])
+
+# ── Dictonary update based on database ────────────────────────────────────
+def load_known_words():
+    sql = "SELECT product_name FROM CEVA_Product_List"
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+    words = []
+    for row in rows:
+        words.extend(row[0].split())  # split product names into individual words
+    return list(set(words))
+
+KNOWN_WORDS = load_known_words()  # load once at startup
+
+# ── Orientation CHECK ────────────────────────────────────
+def check_and_rotate(image, results):
+    if not results:
+        return image
+    heights = []
+    widths  = []
+    for bbox, text, confidence in results:
+        pts    = np.array(bbox)
+        width  = np.linalg.norm(pts[1] - pts[0])
+        height = np.linalg.norm(pts[3] - pts[0])
+        heights.append(height)
+        widths.append(width)
+    avg_width  = np.mean(widths)
+    avg_height = np.mean(heights)
+    print(f"  Avg Width: {avg_width:.1f} | Avg Height: {avg_height:.1f}")
+    if avg_height > avg_width:
+        print("  ⚠ Height > Width — rotating 90° clockwise")
+        return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    else:
+        print("  ✔ Orientation looks correct")
+        return image
+
 # ── VARIANCE CHECK ────────────────────────────────────
-def is_blank_face(image, threshold=50):
+def is_blank_face(image, threshold=30):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     variance = cv2.Laplacian(gray, cv2.CV_64F).var()
     print(f"  Variance Score: {variance:.2f} (threshold: {threshold})")
@@ -100,6 +149,7 @@ def scan_and_lookup(image_path):
         print("\n[STEP 2] Looking up EAN in database...")
         db_start = time.time()
         matched = False
+        matched_row = None
         for barcode in barcodes:
             data = barcode.data.decode("utf-8").strip()
             print(f"  Searching EAN: '{data}'")
@@ -112,12 +162,13 @@ def scan_and_lookup(image_path):
                     print(f"    EAN Number: {product['EAN_number']}")
                     print("-" * 40)
                 matched = True
+                matched_row = rows[0]
             else:
                 print(f"  ✘ No match found for EAN '{data}'")
         print(f"  DB Search Time: {time.time() - db_start:.4f} seconds")
         print(f"\n  Total Program Runtime: {time.time() - program_start:.4f} seconds")
         print("=" * 50)
-        return rows[0] if matched else None
+        return matched_row if matched else None
 
     # ── STEP 2: VARIANCE CHECK ───────────────────────
     print("\n✘ No barcode. Checking if face has content...")
@@ -133,14 +184,45 @@ def scan_and_lookup(image_path):
         print("=" * 50)
         return
 
-    # ── STEP 3: EASYOCR ──────────────────────────────
+    # ── STEP 3: EASYOCR WITH ROTATION ────────────────
     print("✔ Content detected — running EasyOCR...\n")
     print("[STEP 3] Running EasyOCR...")
     start = time.time()
-    results = reader.readtext(
-    image_path,
-    allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+
+    # quick scan to check orientation
+    quick_results = reader.readtext(
+        image,
+        allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -",
     )
+    rotated_image = check_and_rotate(image, quick_results)
+
+    # only re-run OCR if image was actually rotated
+    if rotated_image is not image:
+        image = rotated_image
+        results = reader.readtext(
+            image,
+            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -",
+        )
+    else:
+        results = quick_results    # reuse — no rotation needed, no wasted OCR call
+
+    # check if 180° flip improves confidence
+    conf = avg_confidence(results)
+    if conf < 0.5:
+        print(f"  ⚠ Confidence {conf:.2%} low — trying 180° flip...")
+        flipped = cv2.rotate(image, cv2.ROTATE_180)
+        results_flipped = reader.readtext(
+            flipped,
+            allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -",
+        )
+        conf_flipped = avg_confidence(results_flipped)
+        if conf_flipped > conf:
+            print(f"  ✔ Flipped is better ({conf_flipped:.2%} > {conf:.2%}) — using flipped")
+            image = flipped
+            results = results_flipped
+        else:
+            print(f"  ✘ Flip not better — keeping current orientation")
+
     end = time.time()
 
     if not results:
@@ -174,8 +256,10 @@ def scan_and_lookup(image_path):
             print(f"\n  '{cleaned}' is a NUMBER → searching by partial EAN")
             results_sql = lookup_by_EAN(cleaned)
         else:
-            print(f"\n  '{cleaned}' is a STRING → searching by product name")
-            results_sql = lookup_by_partial_name(cleaned)
+            # ── apply fuzzy correction before DB lookup ──
+            corrected = correct_with_rapidfuzz(cleaned, KNOWN_WORDS, threshold=70)
+            print(f"\n  '{corrected}' is a STRING → searching by product name")
+            results_sql = lookup_by_partial_name(corrected)
 
         if results_sql:
             skus = set()
