@@ -16,6 +16,7 @@ camera.py                Mosquitto broker             trigger_node.py
                           └─ scan_and_lookup.py   ──► /scan/result ROS topic
                               ├─ pyzbar (barcode)
                               ├─ EasyOCR
+                              ├─ RapidFuzz correction
                               └─ MySQL lookup
                                       │
                                  scan/result MQTT
@@ -28,6 +29,9 @@ camera.py                Mosquitto broker             trigger_node.py
 - Omnidirectional scanning using 5 Raspberry Pi cameras
 - Barcode and QR code detection via `pyzbar`
 - OCR fallback using `EasyOCR` for printed text
+- Automatic image orientation correction — detects and rotates sideways images before OCR
+- 180° flip detection — if OCR confidence is low, tries a flipped version and picks the better result
+- Fuzzy text correction via `RapidFuzz` — corrects OCR misreads against known product name words from the database
 - Variance check to skip blank/empty faces before OCR
 - Confidence threshold filtering for OCR results
 - MySQL database lookup by EAN, SKU, or product name
@@ -76,7 +80,7 @@ MySQL Server
 
 Python packages:
 ```
-pip install paho-mqtt flask easyocr opencv-python mysql-connector-python pyzbar
+pip install paho-mqtt flask easyocr opencv-python mysql-connector-python pyzbar rapidfuzz
 ```
 
 System:
@@ -194,6 +198,74 @@ Processing: omnidirectional picture/image_2.jpg
 
 ---
 
+## How It Works
+
+### Scanning Pipeline
+
+Each image goes through 5 steps:
+
+1. **Barcode/QR scan** — `pyzbar` decodes any standard barcode or QR code and looks up the EAN in the database directly
+2. **Variance check** — Laplacian variance detects blank faces with no product label, skipping OCR to save time
+3. **EasyOCR with orientation correction** — a quick scan detects if the image is sideways (height > width of detected text boxes) and rotates 90° if needed. If average OCR confidence is below 50%, a 180° flip is also tried and the better result is kept
+4. **Database lookup with fuzzy correction** — numbers are looked up by EAN. Strings are first corrected using `RapidFuzz` against all known product name words loaded from the database, then looked up by product name
+5. **Result intersection** — if multiple text detections match different products, the most common SKU is selected
+
+### RapidFuzz Text Correction
+
+Before each string is sent to the database, it is matched against a wordlist built from all product names in the database. If the closest match scores above the threshold (default 70), the corrected word is used instead. This handles common OCR misreads like `"Sprey"` → `"Spray"`.
+
+```python
+correct_with_rapidfuzz("Sprey", KNOWN_WORDS, threshold=70)
+# → "Spray" (score: 91)
+```
+
+The wordlist is loaded once at startup from the database so it always reflects your current product catalogue.
+
+### Orientation Correction
+
+EasyOCR runs a quick first pass to measure the average width and height of detected text bounding boxes. If text is taller than it is wide on average, the image is rotated 90° clockwise before the full OCR pass. If the result still has low confidence (below 50%), a 180° flip is attempted and compared.
+
+```
+Sideways image detected → rotate 90° → re-run OCR
+Low confidence result   → try 180° flip → keep better result
+```
+
+### MQTT Topics
+
+| Topic | Direction | Purpose |
+|---|---|---|
+| `camera/capture` | PC → Pi | Trigger cameras to take photo |
+| `scan/start` | PC → PC | Tell scanner that images are ready |
+| `scan/result` | PC → all | Publish matched product as JSON |
+
+### Early Stop
+
+Once a match is found in any of the 5 images, processing stops immediately — remaining images are skipped. A new press of **C** resets the session.
+
+---
+
+## Configuration Reference
+
+### `scan_and_lookup.py`
+
+| Variable | Default | Description |
+|---|---|---|
+| `BROKER` | `"localhost"` | Mosquitto broker IP |
+| `CONFIDENCE_THRESHOLD` | `0.30` | Minimum EasyOCR confidence to attempt DB lookup |
+| `is_blank_face threshold` | `30` | Laplacian variance cutoff for blank face detection |
+| `fuzzy threshold` | `70` | Minimum RapidFuzz score to accept a correction |
+| `flip threshold` | `0.5` | Average confidence below which 180° flip is tried |
+
+### `camera.py`
+
+| Variable | Description |
+|---|---|
+| `LAPTOP_IP` | Windows PC IP address |
+| `DEVICE_ID` | Unique camera ID (1–5) |
+| Camera resolution | `2304 × 1296` |
+
+---
+
 ## ROS2 Integration (Optional)
 
 ### Setup
@@ -234,57 +306,11 @@ BROKER = "192.168.x.x"   # Windows PC running Mosquitto
 
 ---
 
-## How It Works
-
-### Scanning Pipeline
-
-Each image goes through 5 steps:
-
-1. **Barcode/QR scan** — `pyzbar` decodes any standard barcode or QR code and looks up the EAN in the database directly
-2. **Variance check** — Laplacian variance detects blank faces with no product label, skipping OCR to save time
-3. **EasyOCR** — reads all visible text with a confidence threshold of 60%
-4. **Database lookup** — numbers are looked up by EAN, strings by product name
-5. **Result intersection** — if multiple text detections match different products, the most common SKU is selected
-
-### MQTT Topics
-
-| Topic | Direction | Purpose |
-|---|---|---|
-| `camera/capture` | PC → Pi | Trigger cameras to take photo |
-| `scan/start` | PC → PC | Tell scanner that images are ready |
-| `scan/result` | PC → all | Publish matched product as JSON |
-
-### Early Stop
-
-Once a match is found in any of the 5 images, processing stops immediately — remaining images are skipped. A new press of **C** resets the session.
-
----
-
-## Configuration Reference
-
-### `scan_and_lookup.py`
-
-| Variable | Default | Description |
-|---|---|---|
-| `BROKER` | `"localhost"` | Mosquitto broker IP |
-| `CONFIDENCE_THRESHOLD` | `0.60` | Minimum EasyOCR confidence |
-| `is_blank_face threshold` | `50` | Laplacian variance cutoff |
-| `text_threshold` | `0.60` | EasyOCR internal detector threshold |
-
-### `camera.py`
-
-| Variable | Description |
-|---|---|
-| `LAPTOP_IP` | Windows PC IP address |
-| `DEVICE_ID` | Unique camera ID (1–5) |
-| Camera resolution | `2304 × 1296` |
-
----
-
 ## Acknowledgements
 
 - [EasyOCR](https://github.com/JaidedAI/EasyOCR)
 - [pyzbar](https://github.com/NaturalHistoryMuseum/pyzbar)
+- [RapidFuzz](https://github.com/maxbachmann/RapidFuzz)
 - [Picamera2](https://github.com/raspberrypi/picamera2)
 - [Eclipse Mosquitto](https://mosquitto.org/)
 - [ROS2 Humble](https://docs.ros.org/en/humble/)
